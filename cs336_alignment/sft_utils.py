@@ -93,6 +93,8 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension).
     READ notes/compute_entropy.md to learn more.
 
+    计算模型在每个位置预测得有多不确定, 通常不是 SFT loss 必需项, 更多用于监控分析或者后续 RL/探索相关训练.
+
     Args:
         logits: torch.Tensor, A tensor of shape (batch_size, sequence_length, vocab_size)
             containing unnormalized logits over the vocabulary.
@@ -119,7 +121,126 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     entory = lse - exp_logits
 
     return entory
+
+def get_response_log_probs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool,
+) -> torch.Tensor:
+    """Get the conditional log-probs of the response given the prompt,
+        and optionally the entropy of the next token predictions.
+
+    计算模型给标准答案 token 分配了多大概率, 这是 SFT loss 的核心.
+    使用 log 概率的原因:
+    1. 语言模型序列概率是很多 token 概率的乘积, 取 log 后连乘变连加, 数值更稳定
+    2. -log(p) 正好形成交叉熵 loss, 并且对低概率正确答案有更强的训练惩罚.
+
+    Args:
+        model: PreTrainedModel, the model to score.
+        input_ids: torch.Tensor of shape (batch_size, sequence_length):
+            the tokenized prompt and output.
+        labels: torch.Tensor of shape (batch_size, sequence_length):
+            shifted input_ids.
+        return_token_entropy: bool, whether to return the entropy of the
+            next token predictions.
+
+    Returns:
+        dict[str, torch.Tensor]:
+            "log_probs": torch.Tensor of shape (batch_size, sequence_length):
+                the conditional log-probs of the response given the prompt.
+                Note that we have not masked out the token indices corresponding
+                to the prompt or padding; that is done in the train loop.
+            "token_entropy": Optional[torch.Tensor] of shape (batch_size, sequence_length):
+                the entropy of the next token predictions. As with the log-probs,
+                we have not masked out the token indices corresponding to the prompt
+                or padding; that is done in the train loop.
+    """
     
+    # 1. 获取模型的输出 logits
+    outputs = model(input_ids)
+    logits = outputs.logits # (batch_size, sequence_length, vocab_size)
+
+    # 2. 计算所有 token 的 log_softmax
+    # softmax 输出概率, log_softmax 输出 log 概率
+    # 数学上 log_softmax(x) = log(softmax(x)), 但 F.log_softmax 更稳定, 训练语言模型时通常更常用.
+    log_probs_all = F.log_softmax(logits, dim=-1) # (batch_size, sequence_length, vocab_size)
+
+    # 3. 提取对应 label 的对数概率
+    # 因为在训练时我们并不关系除了对应 label 的概率
+    # gather: 按照 index 从指定维度上取值. 要求 index 与输入张量维度一致
+    # unsqueeze(-1): 在最后增加一个维度
+    # squeeze(-1): 删除最后一个大小为 1 的维度.
+    log_probs = torch.gather(
+        log_probs_all,
+        dim=-1,
+        index=labels.unsqueeze(-1)
+    ).squeeze(-1)
+
+    # 4. 构建返回字典
+    results = {"log_probs": log_probs}
+
+    if return_token_entropy:
+        results["token_entropy"] = compute_entropy(logits)
+
+    return results
 
     
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+    normalize_constant: float = 1.0,
+) -> torch.Tensor:
+    """Sum over a dimension and normalize by a constant,
+    considering only the elements with mask value 1.
+
+    把 prompt / padding token 的 loss 屏蔽掉, 只对 response token 的 loss 求和, 
+    并按指定分母归一化, 从而得到正确的 SFT loss. normalize_constant 通常是 response token 的数量.
+
+    Args:
+        tensor: torch.Tensor, the tensor to sum and normalize.
+        mask: torch.Tensor, the mask. We only consider elements
+            with mask value 1.
+        dim: int | None, the dimension to sum along before
+            normalization. If None, sum over all dimensions.
+        normalize_constant: float, the constant to divide by
+            for normalization.
+
+    Returns:
+        torch.Tensor, the normalized sum, where masked elements
+            (mask=0) don't contribute to the sum.
+    """
+    
+    # 1. 将 tensor 与 mask 相乘, 排除 mask == 0 的元素
+    masked_tensor = tensor * mask
+
+    # 2. 根据 dim 进行求和
+    if dim is None:
+        # 对张量中的所有元素求和, 返回一个标量
+        total_sum = torch.sum(masked_tensor)
+    else:
+        # 沿着指定维度求和
+        total_sum = torch.sum(masked_tensor, dim=dim)
+
+    # 3. 除以归一化常数
+    return total_sum / normalize_constant
+
+
+def sft_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant: int | None = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Compute the policy gradient loss and backprop its gradients for a microbatch.
+
+    microbatch 可以理解成把一个大 batch 拆成几个小 batch, 每次只在显存里跑其中一小块, 它主要是为了解决 GPU 显存不够 的问题.
+    假设 global batch = 64, microbatch = 8, 那么每一个 microbatch 就有8条样本. 
+    每个 microbatch 都 forward 一次, 算 loss, backward 一次, 但暂时不更新参数. 
+    等 8 个 microbatch 的梯度都累积完, 再执行一次 optimizer.step() 根据梯度更新参数 optimizer.zero_grad() 清空旧梯度.
+    这叫 gradient accumulation, 即梯度累积. gradient_accumulation_steps 这个参数就是表示被拆分为几个 microbatch.
+    """
+    pass
 
